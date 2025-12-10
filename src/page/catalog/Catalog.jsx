@@ -1,0 +1,736 @@
+// src/page/catalog/Catalog.jsx
+import React, { useEffect, useMemo, useState } from "react";
+import { useLocation } from "react-router-dom";
+
+import Cart from "../ui/Cart";
+
+import SelectIcon from "../../assets/Catalog/select.svg";
+import NoteImg from "../../assets/Catalog/note.svg";
+import { getProducts, getCategories } from "../../api/catalog";
+
+const SORT_OPTIONS = [
+  "Сначала новые",
+  "Популярные",
+  "Цена по убыванию",
+  "Цена по возрастанию",
+];
+
+// Маппер: сразу готовим пропсы для <Cart />, включая акции
+const mapProductToCard = (p) => {
+  const numericPrice =
+    p.price !== null && p.price !== undefined && !Number.isNaN(Number(p.price))
+      ? Number(p.price)
+      : 0;
+
+  const numericOldPrice =
+    p.old_price !== null &&
+    p.old_price !== undefined &&
+    !Number.isNaN(Number(p.old_price))
+      ? Number(p.old_price)
+      : null;
+
+  const discount =
+    typeof p.discount === "number" && !Number.isNaN(p.discount)
+      ? p.discount
+      : null;
+
+  const promotion = !!p.promotion;
+
+  return {
+    id: p.id,
+    slug: p.slug,
+    img: p.main_image || NoteImg,
+    status: p.is_available ? "В наличии" : "Нет в наличии",
+    statusType: p.is_available ? "in" : "out",
+    title: p.name,
+    price: numericPrice,
+
+    // для акций
+    oldPrice: numericOldPrice,
+    discount,
+    promotion,
+
+    // для фильтра по дереву
+    category_id: p.category_id,
+  };
+};
+
+// строим дерево по parent
+const buildCategoryTree = (flat) => {
+  if (!Array.isArray(flat) || !flat.length) return [];
+
+  const byId = {};
+  flat.forEach((c) => {
+    byId[c.id] = { ...c, children: [] };
+  });
+
+  const roots = [];
+
+  flat.forEach((c) => {
+    const node = byId[c.id];
+    if (c.parent && byId[c.parent]) {
+      byId[c.parent].children.push(node);
+    } else {
+      roots.push(node);
+    }
+  });
+
+  return roots;
+};
+
+// рекурсивно собираем id всей ветки
+const collectSubtreeIds = (cat, acc) => {
+  acc.push(cat.id);
+  if (Array.isArray(cat.children)) {
+    cat.children.forEach((child) => collectSubtreeIds(child, acc));
+  }
+};
+
+// поиск нужного корня и сбор его поддерева
+const collectIdsForRoot = (tree, rootId) => {
+  const acc = [];
+  const dfs = (nodes) => {
+    for (const n of nodes) {
+      if (n.id === rootId) {
+        collectSubtreeIds(n, acc);
+        return true;
+      }
+      if (n.children && n.children.length) {
+        if (dfs(n.children)) return true;
+      }
+    }
+    return false;
+  };
+  dfs(tree);
+  return acc;
+};
+
+const Catalog = ({ onAddToCart = () => {} }) => {
+  const location = useLocation();
+
+  const [currentPage, setCurrentPage] = useState(1);
+  const [sort, setSort] = useState("Сначала новые");
+  const [sortOpen, setSortOpen] = useState(false);
+  const [mobileFiltersOpen, setMobileFiltersOpen] = useState(false);
+
+  const [products, setProducts] = useState([]);
+  const [count, setCount] = useState(0);
+  const [pageSize, setPageSize] = useState(12);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState("");
+
+  // категории
+  const [categories, setCategories] = useState([]); // дерево
+  const [categoriesLoading, setCategoriesLoading] = useState(false);
+  const [categoriesError, setCategoriesError] = useState("");
+  const [activeCategoryId, setActiveCategoryId] = useState(null);
+
+  // режим фильтра: null | "tree" | "single"
+  const [categoryFilterMode, setCategoryFilterMode] = useState(null);
+  // все id в выбранной ветке
+  const [activeTreeIds, setActiveTreeIds] = useState([]);
+  // initial tree root из URL (?categoryTree=)
+  const [initialTreeRootId, setInitialTreeRootId] = useState(null);
+
+  // раскрытые категории
+  const [expandedIds, setExpandedIds] = useState([]);
+
+  const isExpanded = (id) => expandedIds.includes(id);
+  const toggleExpanded = (id) => {
+    setExpandedIds((prev) =>
+      prev.includes(id) ? prev.filter((x) => x !== id) : [...prev, id]
+    );
+  };
+
+  // читаем ?category и ?categoryTree
+  useEffect(() => {
+    const searchParams = new URLSearchParams(location.search);
+    const treeParam = searchParams.get("categoryTree");
+    const catParam = searchParams.get("category");
+
+    if (treeParam) {
+      const rootId = Number(treeParam);
+      if (!Number.isNaN(rootId)) {
+        setActiveCategoryId(rootId);
+        setCategoryFilterMode("tree");
+        setInitialTreeRootId(rootId);
+        setActiveTreeIds([]);
+        setCurrentPage(1);
+      }
+      return;
+    }
+
+    if (catParam) {
+      const catId = Number(catParam);
+      if (!Number.isNaN(catId)) {
+        setActiveCategoryId(catId);
+        setCategoryFilterMode("single");
+        setInitialTreeRootId(null);
+        setActiveTreeIds([]);
+        setCurrentPage(1);
+      }
+    } else {
+      // без параметров
+      setActiveCategoryId(null);
+      setCategoryFilterMode(null);
+      setInitialTreeRootId(null);
+      setActiveTreeIds([]);
+      setCurrentPage(1);
+    }
+  }, [location.search]);
+
+  // ---------- КАТЕГОРИИ ----------
+  useEffect(() => {
+    let cancelled = false;
+
+    const loadCategories = async () => {
+      try {
+        setCategoriesLoading(true);
+        setCategoriesError("");
+
+        const data = await getCategories({ page: 1, page_size: 200 });
+
+        if (cancelled) return;
+
+        let results = [];
+        if (Array.isArray(data?.results)) {
+          results = data.results;
+        } else if (Array.isArray(data)) {
+          results = data;
+        }
+
+        const active = results.filter((c) => c.is_active !== false);
+
+        const hasChildrenField = active.some((c) => Array.isArray(c.children));
+        const tree = hasChildrenField ? active : buildCategoryTree(active);
+
+        setCategories(tree);
+      } catch (e) {
+        if (cancelled) return;
+        console.error("Failed to load categories", e);
+        setCategoriesError("Не удалось загрузить категории.");
+        setCategories([]);
+      } finally {
+        if (!cancelled) setCategoriesLoading(false);
+      }
+    };
+
+    loadCategories();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  // когда уже есть дерево и initialTreeRootId — собираем ids для ветки
+  useEffect(() => {
+    if (!initialTreeRootId || !categories.length) return;
+    const ids = collectIdsForRoot(categories, initialTreeRootId);
+    setActiveTreeIds(ids);
+  }, [categories, initialTreeRootId]);
+
+  // ---------- ТОВАРЫ ----------
+  useEffect(() => {
+    let cancelled = false;
+
+    const load = async () => {
+      // если режим "tree", но ids ещё нет — ждём
+      if (categoryFilterMode === "tree" && activeTreeIds.length === 0) {
+        setProducts([]);
+        setCount(0);
+        setLoading(false);
+        return;
+      }
+
+      try {
+        setLoading(true);
+        setError("");
+
+        const params = { page: currentPage };
+
+        if (categoryFilterMode === "single" && activeCategoryId) {
+          params.category = activeCategoryId;
+        } else if (categoryFilterMode === "tree") {
+          params.page_size = 300;
+        }
+
+        const data = await getProducts(params);
+
+        if (cancelled) return;
+
+        if (!data || typeof data !== "object") {
+          setProducts([]);
+          setCount(0);
+          return;
+        }
+
+        let results = Array.isArray(data.results) ? data.results : [];
+
+        if (categoryFilterMode === "tree" && activeTreeIds.length) {
+          results = results.filter((p) =>
+            activeTreeIds.includes(p.category_id)
+          );
+        }
+
+        const cards = results.map(mapProductToCard);
+        setProducts(cards);
+        setCount(cards.length);
+        if (cards.length) setPageSize(cards.length);
+      } catch (e) {
+        if (cancelled) return;
+        console.error("Failed to load products", e);
+        setError("Не удалось загрузить товары. Попробуйте обновить страницу.");
+        setProducts([]);
+      } finally {
+        if (!cancelled) setLoading(false);
+      }
+    };
+
+    load();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [currentPage, activeCategoryId, categoryFilterMode, activeTreeIds]);
+
+  const totalPages = useMemo(
+    () => (pageSize ? Math.max(1, Math.ceil(count / pageSize)) : 1),
+    [count, pageSize]
+  );
+
+  const sortedProducts = useMemo(() => {
+    const items = [...products];
+
+    if (sort === "Цена по убыванию") {
+      items.sort((a, b) => b.price - a.price);
+    } else if (sort === "Цена по возрастанию") {
+      items.sort((a, b) => a.price - b.price);
+    }
+    return items;
+  }, [sort, products]);
+
+  const goToPage = (page) => {
+    if (page < 1 || page > totalPages) return;
+    setCurrentPage(page);
+  };
+
+  // ---------- дерево категорий ----------
+
+  const renderCategoryBlock = (cat, level = 0, isRoot = false) => {
+    const hasChildren = Array.isArray(cat.children) && cat.children.length > 0;
+    const expanded = isExpanded(cat.id);
+    const isActiveParent =
+      activeCategoryId === cat.id && categoryFilterMode === "tree";
+
+    const rootBase =
+      "flex h-[40px] w-full items-center justify-between rounded-[10px] px-3 text-[14px] font-medium transition-colors cursor-pointer";
+    const childBase =
+      "flex h-[32px] w-full items-center justify-between rounded-[4px] px-3 text-[13px] transition-colors cursor-pointer";
+
+    const headerClass = isRoot
+      ? `${rootBase} ${
+          expanded
+            ? "bg-[#91E456] text-white"
+            : "bg-[#E0E1F6] text-[#111111] hover:bg-[#d3d4f2]"
+        }`
+      : `${childBase} ${
+          expanded
+            ? "bg-[#00009833] text-[#111111]"
+            : "bg-[#0000981A] text-[#111111] hover:bg-[#00009833]"
+        }`;
+
+    return (
+      <div key={cat.id} className={isRoot ? "mb-[6px]" : "mt-[4px]"}>
+        {/* шапка группы */}
+        <button
+          type="button"
+          onClick={() => hasChildren && toggleExpanded(cat.id)}
+          className={headerClass}
+          style={
+            !isRoot
+              ? {
+                  paddingLeft: 12 + level * 12,
+                }
+              : undefined
+          }
+        >
+          <span className="truncate">{cat.name}</span>
+          {hasChildren && (
+            <img
+              src={SelectIcon}
+              alt=""
+              className={`w-[10px] h-[6px] flex-shrink-0 ml-2 transition-transform ${
+                expanded ? "rotate-180" : ""
+              }`}
+            />
+          )}
+        </button>
+
+        {/* контент внутри раскрытого блока */}
+        {hasChildren && expanded && (
+          <div className="mt-[4px]">
+            {/* "Посмотреть все товары" по этой группе */}
+            <button
+              type="button"
+              onClick={() => {
+                const ids = [];
+                collectSubtreeIds(cat, ids);
+                setActiveCategoryId(cat.id);
+                setCategoryFilterMode("tree");
+                setInitialTreeRootId(cat.id);
+                setActiveTreeIds(ids);
+                setCurrentPage(1);
+              }}
+              className={`flex h-[28px] w-full items-center justify-between rounded-[4px] px-3 text-[13px] mb-[4px] ${
+                isActiveParent
+                  ? "text-[#91E456] font-semibold"
+                  : "text-[#111111] hover:text-[#91E456]"
+              }`}
+              style={{
+                paddingLeft: isRoot ? 16 : 24 + level * 12,
+              }}
+            >
+              <span className="truncate">Посмотреть все товары</span>
+            </button>
+
+            {/* дети */}
+            {cat.children.map((child) => {
+              const childHasChildren =
+                Array.isArray(child.children) && child.children.length > 0;
+              const childActive =
+                activeCategoryId === child.id &&
+                categoryFilterMode === "single";
+
+              if (childHasChildren) {
+                return renderCategoryBlock(child, level + 1, false);
+              }
+
+              // листовые подкатегории
+              return (
+                <button
+                  key={child.id}
+                  type="button"
+                  onClick={() => {
+                    setActiveCategoryId(child.id);
+                    setCategoryFilterMode("single");
+                    setInitialTreeRootId(null);
+                    setActiveTreeIds([]);
+                    setCurrentPage(1);
+                  }}
+                  className={`flex h-[28px] w-full items-center justify-between rounded-[4px] px-3 text-[13px] mb-[2px] ${
+                    childActive
+                      ? "text-[#91E456] font-semibold"
+                      : "text-[#111111] hover:text-[#91E456]"
+                  }`}
+                  style={{
+                    paddingLeft: isRoot ? 16 : 24 + level * 12,
+                  }}
+                >
+                  <span className="truncate">{child.name}</span>
+                </button>
+              );
+            })}
+          </div>
+        )}
+      </div>
+    );
+  };
+
+  const renderFilters = () => {
+    if (categoriesLoading && !categories.length) {
+      return (
+        <div className="text-[13px] text-[#777] px-1">
+          Загрузка категорий...
+        </div>
+      );
+    }
+
+    if (categoriesError && !categories.length) {
+      return (
+        <div className="text-[13px] text-[#E15241] px-1">
+          {categoriesError}
+        </div>
+      );
+    }
+
+    if (!categories.length) {
+      return (
+        <div className="text-[13px] text-[#777] px-1">
+          Категории не найдены.
+        </div>
+      );
+    }
+
+    return (
+      <div className="flex flex-col gap-2">
+        {/* Все категории */}
+        <button
+          type="button"
+          onClick={() => {
+            setActiveCategoryId(null);
+            setCategoryFilterMode(null);
+            setInitialTreeRootId(null);
+            setActiveTreeIds([]);
+            setCurrentPage(1);
+          }}
+          className={`
+            flex h-[40px] w-full items-center
+            rounded-[10px]
+            px-3
+            text-[14px]
+            bg-[#E0E1F6]
+            transition-colors
+            ${
+              activeCategoryId === null && categoryFilterMode === null
+                ? "text-[#91E456] font-semibold"
+                : "text-[#111111] hover:bg-[#d3d4f2]"
+            }
+          `}
+        >
+          <span className="truncate">Все категории</span>
+        </button>
+
+        {categories.map((cat) => renderCategoryBlock(cat, 0, true))}
+      </div>
+    );
+  };
+
+  const showPagination = count > 0;
+
+  return (
+    <section className="w-full bg-[#F7F7FF] font-['Open_Sans']">
+      <div className="max-w-[1200px] mx-auto px-3 sm:px-4 pb-[30px]">
+        {/* Заголовок */}
+        <div className="pt-[40px]">
+          <h1 className="text-[40px] sm:text-[44px] text-[#111] font-['Alumni_Sans_SC']">
+            Каталог
+          </h1>
+          <p className="mt-1 text-[14px] text-[#8A8BA0]">
+            {count || 0} товаров
+          </p>
+        </div>
+
+        {/* Линия: слева Категории, справа сортировка */}
+        <div className="mt-4 flex items-center justify-between gap-4">
+          <button
+            type="button"
+            onClick={() => setMobileFiltersOpen(true)}
+            className="
+              inline-flex items-center gap-2
+              rounded-[6px]
+              bg-[#91E456]
+              px-5 py-2.5
+              text-[14px] text-white
+              active:scale-[0.98]
+              lg:hidden
+            "
+          >
+            <span>Категории</span>
+            <img
+              src={SelectIcon}
+              alt=""
+              className="w-[10px] h-[6px] invert brightness-0"
+            />
+          </button>
+
+          {/* сортировка */}
+          <div className="ml-auto relative">
+            <button
+              type="button"
+              onClick={() => setSortOpen((v) => !v)}
+              className="
+                flex items-center gap-2
+                text-[14px]
+                text-[#333333]
+                hover:text-[#91E456]
+              "
+            >
+              <span>{sort}</span>
+              <img
+                src={SelectIcon}
+                alt=""
+                className={`
+                  w-[10px] h-[6px] opacity-60
+                  transition-transform
+                  ${sortOpen ? "rotate-180" : ""}
+                `}
+              />
+            </button>
+
+            {sortOpen && (
+              <div
+                className="
+                  absolute right-0 mt-[6px] z-20
+                  w-[220px]
+                  rounded-[4px]
+                  bg-[#2F2F2F]
+                  text-white
+                  shadow-[0_8px_18px_rgba(15,23,42,0.25)]
+                "
+              >
+                {SORT_OPTIONS.map((option) => (
+                  <button
+                    key={option}
+                    type="button"
+                    onClick={() => {
+                      setSort(option);
+                      setSortOpen(false);
+                    }}
+                    className={`
+                      w-full px-4 py-2 text-left text-[14px]
+                      ${
+                        option === sort
+                          ? "text-[#91E456]"
+                          : "hover:text-[#91E456]"
+                      }
+                    `}
+                  >
+                    {option}
+                  </button>
+                ))}
+              </div>
+            )}
+          </div>
+        </div>
+
+        {/* Контент */}
+        <div className="mt-6 flex flex-col gap-8 lg:flex-row lg:items-start lg:justify-between">
+          {/* Левая колонка — фильтры */}
+          <div className="hidden w-[190px] shrink-0 lg:block">
+            {renderFilters()}
+          </div>
+
+          {/* Правая часть */}
+          <div className="flex-1 min-w-0">
+            {error && (
+              <p className="mb-4 text-[14px] text-red-500">{error}</p>
+            )}
+
+            <div
+              className="
+                grid place-items-center
+                grid-cols-1
+                min-[568px]:grid-cols-2
+                md:grid-cols-3
+                xl:grid-cols-4
+                gap-x-5 gap-y-8
+              "
+            >
+              {loading && products.length === 0 && !error && (
+                <p className="text-[14px] text-[#777] col-span-full">
+                  Загрузка товаров...
+                </p>
+              )}
+
+              {!loading &&
+                sortedProducts.map((p) => (
+                  <Cart key={p.id} {...p} onAddToCart={onAddToCart} />
+                ))}
+
+              {!loading && !error && sortedProducts.length === 0 && (
+                <p className="text-[14px] text-[#777] col-span-full">
+                  Товары не найдены.
+                </p>
+              )}
+            </div>
+
+            {/* Пагинация с зелёным активным квадратом */}
+            {showPagination && (
+              <div className="mt-10 mb-[30px] flex justify-center">
+                <div className="flex items-center justify-center gap-2">
+                  <button
+                    type="button"
+                    onClick={() => goToPage(currentPage - 1)}
+                    disabled={currentPage === 1}
+                    className="
+                      w-[34px] h-[34px]
+                      flex items-center justify-center
+                      rounded-[6px]
+                      border border-[#ECECF5]
+                      bg-white
+                      text-[14px]
+                      disabled:bg-[#F5F5F5] disabled:text-[#C0C0C0]
+                    "
+                  >
+                    &lt;
+                  </button>
+
+                  <div
+                    className="
+                      w-[34px] h-[34px]
+                      flex items-center justify-center
+                      rounded-[6px]
+                      bg-[#91E456]
+                      text-white
+                      text-[14px] font-medium
+                    "
+                  >
+                    {currentPage}
+                  </div>
+
+                  <button
+                    type="button"
+                    onClick={() => goToPage(currentPage + 1)}
+                    disabled={currentPage === totalPages}
+                    className="
+                      w-[34px] h-[34px]
+                      flex items-center justify-center
+                      rounded-[6px]
+                      border border-[#ECECF5]
+                      bg-white
+                      text-[14px]
+                      disabled:bg-[#F5F5F5] disabled:text-[#C0C0C0]
+                    "
+                  >
+                    &gt;
+                  </button>
+                </div>
+              </div>
+            )}
+          </div>
+        </div>
+      </div>
+
+      {/* Мобильная модалка категорий */}
+      {mobileFiltersOpen && (
+        <div className="fixed inset-0 z-40 lg:hidden">
+          <button
+            type="button"
+            onClick={() => setMobileFiltersOpen(false)}
+            className="absolute inset-0 bg-black/30"
+          />
+
+          <div
+            className="
+              absolute right-4 top-[150px]
+              w-[90%] max-w-[420px]
+              h-[450px]
+              bg-white
+              rounded-[16px]
+              shadow-[0_0_20px_rgba(15,23,42,0.35)]
+              flex flex-col
+            "
+          >
+            <div className="flex items-center justify-between px-4 py-3 border-b border-[#ECECF5]">
+              <span className="text-[15px] font-semibold text-[#111111]">
+                Категории
+              </span>
+              <button
+                type="button"
+                onClick={() => setMobileFiltersOpen(false)}
+                className="text-[20px] leading-none text-[#8A8BA0] hover:text-[#C0392B]"
+              >
+                ×
+              </button>
+            </div>
+
+            <div className="flex-1 overflow-y-auto px-4 py-3">
+              {renderFilters()}
+            </div>
+          </div>
+        </div>
+      )}
+    </section>
+  );
+};
+
+export default Catalog;

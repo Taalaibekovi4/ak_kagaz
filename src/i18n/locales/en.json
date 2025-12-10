@@ -1,0 +1,15 @@
+{
+  "header": {
+    "home": "Home",
+    "catalog": "Catalog",
+    "actions": "Promotions",
+    "popular": "Popular Products",
+    "new": "New",
+    "news": "News",
+    "about": "About",
+    "contacts": "Contacts"
+  },
+  "buttons": {
+    "addToCart": "Add to cart"
+  }
+}
