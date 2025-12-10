@@ -1,5 +1,6 @@
 // src/page/homePage/components/Categories.jsx
 import React from "react";
+import { useNavigate } from "react-router-dom";
 
 import Cat1 from "../../../../assets/Categories/1catigor.svg";
 import Cat2 from "../../../../assets/Categories/2catigor.svg";
@@ -22,6 +23,16 @@ const CATEGORIES = [
 ];
 
 const Categories = () => {
+  const navigate = useNavigate();
+
+  const handleCategoryClick = (id) => {
+    // только первая карточка
+    if (id === 1) {
+      navigate("/wholesale-products");
+    }
+    // для остальных пока ничего не делаем
+  };
+
   return (
     <section className="w-full bg-[#F7F7FF]">
       <div className="mx-auto max-w-[1200px] px-3 sm:px-4 pt-[48px] pb-[72px] sm:pt-[56px] sm:pb-[80px] lg:pt-[62px] lg:pb-[90px]">
@@ -53,6 +64,7 @@ const Categories = () => {
             <button
               key={id}
               type="button"
+              onClick={() => handleCategoryClick(id)}
               className="
                 group
                 w-full max-w-[260px] sm:max-w-[280px] lg:max-w-[299px]
